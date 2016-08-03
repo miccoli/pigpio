@@ -5572,7 +5572,7 @@ static void alertEmit(
             DBG(DBG_INTERNAL, "close notify pipe %d", gpioNotify[n].fd);
             close(gpioNotify[n].fd);
 
-            sprintf(fifo, "/dev/pigpio%d", n);
+            PI_MKSLOT(fifo, n);
 
             unlink(fifo);
          }
@@ -10553,7 +10553,7 @@ int gpioNotifyOpenWithSize(int bufSize)
    if (slot < 0)
       SOFT_ERROR(PI_NO_HANDLE, "no handle");
 
-   sprintf(name, "/dev/pigpio%d", slot);
+   PI_MKSLOT(name, slot);
 
    myCreatePipe(name, 0664);
 

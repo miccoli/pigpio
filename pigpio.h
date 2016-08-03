@@ -358,9 +358,10 @@ rawDumpScript              Not intended for general use
 
 OVERVIEW*/
 
-#define PI_INPFIFO "/dev/pigpio"
-#define PI_OUTFIFO "/dev/pigout"
-#define PI_ERRFIFO "/dev/pigerr"
+#define PI_INPFIFO "/var/run/pigpio"
+#define PI_OUTFIFO "/var/run/pigout"
+#define PI_ERRFIFO "/var/run/pigerr"
+#define PI_MKSLOT(str, n) snprintf(str, sizeof(str), "%s%d", PI_INPFIFO, n)
 
 #define PI_ENVPORT "PIGPIO_PORT"
 #define PI_ENVADDR "PIGPIO_ADDR"
@@ -1435,9 +1436,9 @@ A notification is a method for being notified of GPIO state changes
 via a pipe or socket.
 
 Pipe notifications for handle x will be available at the pipe
-named /dev/pigpiox (where x is the handle number).  E.g. if the
+named <PI_INPFIFO>x (where x is the handle number).  E.g. if the
 function returns 15 then the notifications must be read
-from /dev/pigpio15.
+from /var/run/pigpio15.
 
 Socket notifications are returned to the socket which requested the
 handle.
@@ -1447,7 +1448,7 @@ h = gpioNotifyOpen();
 
 if (h >= 0)
 {
-   sprintf(str, "/dev/pigpio%d", h);
+   PI_MKSLOT(str, h);
 
    fd = open(str, "r");
 
@@ -5456,7 +5457,7 @@ PARAMS*/
 PI CMD_NOIB only works on the socket interface.
 It returns a spare notification handle.  Notifications for
 that handle will be sent to the socket (rather than a
-/dev/pigpiox pipe).
+<PI_INPFIFO>x pipe).
 
 The socket should be dedicated to receiving notifications
 after this command is issued.

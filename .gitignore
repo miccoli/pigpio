@@ -1,0 +1,11 @@
+*.pyc
+*.o
+lib*.so
+__pycache__
+#
+pig2vcd
+pigpiod
+pigs
+x_pigpio
+x_pigpiod_if
+x_pigpiod_if2

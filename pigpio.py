@@ -288,6 +288,12 @@ VERSION = "1.32"
 
 exceptions = True
 
+# GPIO input fifo
+
+PI_INPFIFO = "/var/run/pigpio"
+PI_OUTFIFO = "/var/run/pigout"
+PI_ERRFIFO = "/var/run/pigerr"
+
 # GPIO levels
 
 OFF   = 0
@@ -1454,10 +1460,10 @@ class pi():
       provided by [*callback*] should be used instead.
 
       Notifications for handle x will be available at the pipe
-      named /dev/pigpiox (where x is the handle number).
+      named PI_INPFIFO + "%d" % x (where x is the handle number).
 
       E.g. if the function returns 15 then the notifications must be
-      read from /dev/pigpio15.
+      read from /var/run/pigpio15.
 
       Notifications have the following structure.
 

@@ -252,7 +252,7 @@ def t4():
    time.sleep(1)
 
    try:
-      f = open("/dev/pigpio"+ str(h), "rb")
+      f = open(pigpio.PI_INPFIFO + str(h), "rb")
    except IOError:
       f = None
 

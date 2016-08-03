@@ -262,7 +262,7 @@ void t4(int pi)
 
    time_sleep(1);
 
-   sprintf(p, "/dev/pigpio%d", h);
+   PI_MKSLOT(p, h);
 
    f = open(p, O_RDONLY);
 
