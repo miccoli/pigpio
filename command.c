@@ -26,7 +26,7 @@ For more information, please refer to <http://unlicense.org/>
 */
 
 /*
-This version is for pigpio version 55+
+This version is for pigpio version 57+
 */
 
 #include <stdio.h>
@@ -55,11 +55,20 @@ cmdInfo_t cmdInfo[]=
    {PI_CMD_BS1,   "BS1",   111, 1}, // gpioWrite_Bits_0_31_Set
    {PI_CMD_BS2,   "BS2",   111, 1}, // gpioWrite_Bits_32_53_Set
 
+   {PI_CMD_BSCX,  "BSCX",  193, 8}, // bscXfer
+
+   {PI_CMD_BSPIC, "BSPIC", 112, 0}, // bbSPIClose
+   {PI_CMD_BSPIO, "BSPIO", 134, 0}, // bbSPIOpen
+   {PI_CMD_BSPIX, "BSPIX", 193, 6}, // bbSPIXfer
+
    {PI_CMD_CF1,   "CF1",   195, 2}, // gpioCustom1
    {PI_CMD_CF2,   "CF2",   195, 6}, // gpioCustom2
 
    {PI_CMD_CGI,   "CGI",   101, 4}, // gpioCfgGetInternals
    {PI_CMD_CSI,   "CSI",   111, 1}, // gpioCfgSetInternals
+
+   {PI_CMD_EVM,   "EVM",   122, 1}, // eventMonitor
+   {PI_CMD_EVT,   "EVT",   112, 0}, // eventTrigger
 
    {PI_CMD_FC,    "FC",    112, 0}, // fileClose
 
@@ -213,6 +222,7 @@ cmdInfo_t cmdInfo[]=
    {PI_CMD_DCR  , "DCR"  , 113, 0},
    {PI_CMD_DCRA , "DCRA" , 101, 0},
    {PI_CMD_DIV  , "DIV"  , 111, 0},
+   {PI_CMD_EVTWT, "EVTWT", 111, 0},
    {PI_CMD_HALT , "HALT" , 101, 0},
    {PI_CMD_INR  , "INR"  , 113, 0},
    {PI_CMD_INRA , "INRA" , 101, 0},
@@ -256,16 +266,27 @@ BC2 bits         Clear GPIO in bank 2\n\
 BI2CC sda        Close bit bang I2C\n\
 BI2CO sda scl baud | Open bit bang I2C\n\
 BI2CZ sda ...    I2C bit bang multiple transactions\n\
+\n\
+BSPIC cs        Close bit bang SPI\n\
+BSPIO cs miso mosi sclk baud flag | Open bit bang SPI\n\
+BSPIX cs ...    SPI bit bang transfer\n\
+\n\
 BR1              Read bank 1 GPIO\n\
 BR2              Read bank 2 GPIO\n\
+\n\
 BS1 bits         Set GPIO in bank 1\n\
 BS2 bits         Set GPIO in bank 2\n\
+\n\
+BSCX bctl bvs    BSC I2C/SPI transfer\n\
 \n\
 CF1 ...          Custom function 1\n\
 CF2 ...          Custom function 2\n\
 \n\
 CGI              Configuration get internals\n\
 CSI v            Configuration set internals\n\
+\n\
+EVM h bits       Set events to monitor\n\
+EVT n            Trigger event\n\
 \n\
 FC h             Close file handle\n\
 FG g steady      Set glitch filter on GPIO\n\
@@ -375,11 +396,18 @@ WVTX wid         Transmit wave as one-shot\n\
 WVTXM wid wmde   Transmit wave using mode\n\
 WVTXR wid        Transmit wave repeatedly\n\
 \n\
-\n\
 Numbers may be entered as hex (prefix 0x), octal (prefix 0),\n\
 otherwise they are assumed to be decimal.\n\
 \n\
-man pigs for full details.\n\n";
+Examples\n\
+\n\
+pigs w 4 1         # set GPIO 4 high\n\
+pigs r 5           # read GPIO 5\n\
+pigs t             # get current tick\n\
+pigs i2co 1 0x20 0 # get handle to device 0x20 on I2C bus 1\n\
+\n\
+man pigs for full details.\n\
+\n";
 
 typedef struct
 {
@@ -529,6 +557,9 @@ static errInfo_t errInfo[]=
    {PI_FILE_IS_A_DIR    , "file is a directory"},
    {PI_BAD_SHELL_STATUS , "bad shell return status"},
    {PI_BAD_SCRIPT_NAME  , "bad script name"},
+   {PI_BAD_SPI_BAUD     , "bad SPI baud rate, not 50-500k"},
+   {PI_NOT_SPI_GPIO     , "no bit bang SPI in progress on GPIO"},
+   {PI_BAD_EVENT_ID     , "bad event id"},
 
 };
 
@@ -599,8 +630,8 @@ int cmdParse(
    char *p8;
    int32_t *p32;
    char c;
-   uint32_t tp1=0, tp2=0, tp3=0;
-   int8_t to1, to2, to3;
+   uint32_t tp1=0, tp2=0, tp3=0, tp4=0, tp5=0;
+   int8_t to1, to2, to3, to4, to5;
    int eaten;
 
    /* Check that ext is big enough for the largest message. */
@@ -653,7 +684,7 @@ int cmdParse(
       case 112: /* BI2CC FC  GDC  GPW  I2CC  I2CRB
                    MG  MICS  MILS  MODEG  NC  NP  PADG PFG  PRG
                    PROCD  PROCP  PROCS  PRRG  R  READ  SLRC  SPIC
-                   WVDEL  WVSC  WVSM  WVSP  WVTX  WVTXR
+                   WVDEL  WVSC  WVSM  WVSP  WVTX  WVTXR  BSPIC
 
                    One positive parameter.
                 */
@@ -914,6 +945,36 @@ int cmdParse(
 
          break;
 
+      case 134: /* BSPIO
+
+                   Six parameters.  First to Fifth positive.
+                   Sixth may be negative when interpreted as an int.
+                */
+         ctl->eaten += getNum(buf+ctl->eaten, &p[1], &ctl->opt[1]);
+         ctl->eaten += getNum(buf+ctl->eaten, &tp1, &to1);
+         ctl->eaten += getNum(buf+ctl->eaten, &tp2, &to2);
+         ctl->eaten += getNum(buf+ctl->eaten, &tp3, &to3);
+         ctl->eaten += getNum(buf+ctl->eaten, &tp4, &to4);
+         ctl->eaten += getNum(buf+ctl->eaten, &tp5, &to5);
+                                    
+         if ((ctl->opt[1] > 0) && ((int)p[1] >= 0) &&
+             (to1 == CMD_NUMERIC) && ((int)tp1 >= 0) &&
+             (to2 == CMD_NUMERIC) && ((int)tp2 >= 0) &&
+             (to3 == CMD_NUMERIC) && ((int)tp3 >= 0) &&
+             (to4 == CMD_NUMERIC) && ((int)tp4 >= 0) &&
+             (to5 == CMD_NUMERIC))
+         {
+            p[3] = 5 * 4;
+            memcpy(ext+ 0, &tp1, 4);
+            memcpy(ext+ 4, &tp2, 4);
+            memcpy(ext+ 8, &tp3, 4);
+            memcpy(ext+12, &tp4, 4);
+            memcpy(ext+16, &tp5, 4);
+            valid = 1;
+         }
+
+         break;
+
       case 191: /* PROCR
 
                    One to 11 parameters, first positive,
@@ -970,9 +1031,12 @@ int cmdParse(
 
          break;
 
-      case 193: /* BI2CZ  FW  I2CWD  I2CZ  SERW  SPIW  SPIX
+      case 193: /* BI2CZ  BSCX  BSPIX  FW  I2CWD  I2CZ  SERW
+		   SPIW  SPIX
 
                    Two or more parameters, first >=0, rest 0-255.
+
+		   BSCX is special case one or more.
                 */
          ctl->eaten += getNum(buf+ctl->eaten, &p[1], &ctl->opt[1]);
 
@@ -999,7 +1063,7 @@ int cmdParse(
 
             p[3] = pars;
 
-            if (pars) valid = 1;
+            if (pars || (p[0]==PI_CMD_BSCX)) valid = 1;
          }
 
          break;

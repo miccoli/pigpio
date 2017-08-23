@@ -56,7 +56,7 @@ If you wish to handle the returned status yourself you should set
 pigpio.exceptions to False.
 
 You may prefer to check the returned status in only a few parts
-of your code.  In that case do the following.
+of your code.  In that case do the following:
 
 ...
 pigpio.exceptions = False
@@ -238,6 +238,15 @@ spi_read                  Reads bytes from a SPI device
 spi_write                 Writes bytes to a SPI device
 spi_xfer                  Transfers bytes with a SPI device
 
+bb_spi_open               Opens GPIO for bit banging SPI
+bb_spi_close              Closes GPIO for bit banging SPI
+bb_spi_xfer               Transfers bytes with bit banging SPI
+
+I2C/SPI_Slave
+
+bsc_xfer                  I2C/SPI as slave transfer
+bsc_i2c                   I2C as slave transfer
+
 Serial
 
 serial_open               Opens a serial device
@@ -259,6 +268,12 @@ file_read                 Reads bytes from a file
 file_write                Writes bytes to a file
 file_seek                 Seeks to a position within a file
 file_list                 List files which match a pattern
+
+Events
+
+event_callback            Sets a callback for an event
+event_trigger             Triggers an event
+wait_for_event            Wait for an event
 
 Custom
 
@@ -284,7 +299,7 @@ import threading
 import os
 import atexit
 
-VERSION = "1.32"
+VERSION = "1.38"
 
 exceptions = True
 
@@ -339,6 +354,7 @@ PI_SCRIPT_FAILED =4
 
 # notification flags
 
+NTFY_FLAGS_EVENT = (1 << 7)
 NTFY_FLAGS_ALIVE = (1 << 6)
 NTFY_FLAGS_WDOG  = (1 << 5)
 NTFY_FLAGS_GPIO  = 31
@@ -364,6 +380,23 @@ FILE_TRUNC=16
 FROM_START=0
 FROM_CURRENT=1
 FROM_END=2
+
+SPI_MODE_0 = 0
+SPI_MODE_1 = 1
+SPI_MODE_2 = 2
+SPI_MODE_3 = 3
+
+SPI_CPHA = 1 << 0
+SPI_CPOL = 1 << 1
+
+SPI_CS_HIGH_ACTIVE  = 1 << 2
+
+SPI_TX_LSBFIRST = 1 << 14
+SPI_RX_LSBFIRST = 1 << 15
+
+EVENT_BSC = 31
+
+_SOCK_CMD_LEN = 16
 
 # pigpio command numbers
 
@@ -502,6 +535,15 @@ _PI_CMD_FW   =107
 _PI_CMD_FS   =108
 _PI_CMD_FL   =109
 _PI_CMD_SHELL=110
+
+_PI_CMD_BSPIC=111
+_PI_CMD_BSPIO=112
+_PI_CMD_BSPIX=113
+
+_PI_CMD_BSCX =114
+
+_PI_CMD_EVM  =115
+_PI_CMD_EVT  =116
 
 # pigpio error numbers
 
@@ -646,6 +688,9 @@ PI_NO_FILE_ACCESS   =-137
 PI_FILE_IS_A_DIR    =-138
 PI_BAD_SHELL_STATUS =-139
 PI_BAD_SCRIPT_NAME  =-140
+PI_BAD_SPI_BAUD     =-141
+PI_NOT_SPI_GPIO     =-142
+PI_BAD_EVENT_ID     =-143
 
 # pigpio error text
 
@@ -788,8 +833,32 @@ _errors=[
    [PI_FILE_IS_A_DIR     , "file is a directory"],
    [PI_BAD_SHELL_STATUS  , "bad shell return status"],
    [PI_BAD_SCRIPT_NAME   , "bad script name"],
-
+   [PI_BAD_SPI_BAUD      , "bad SPI baud rate, not 50-500k"],
+   [PI_NOT_SPI_GPIO      , "no bit bang SPI in progress on GPIO"],
+   [PI_BAD_EVENT_ID      , "bad event id"],
 ]
+
+_except_a = "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%\n{}"
+
+_except_z = "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%"
+
+_except_1 = """
+Did you start the pigpio daemon? E.g. sudo pigpiod
+
+Did you specify the correct Pi host/port in the environment
+variables PIGPIO_ADDR/PIGPIO_PORT?
+E.g. export PIGPIO_ADDR=soft, export PIGPIO_PORT=8888
+
+Did you specify the correct Pi host/port in the
+pigpio.pi() function? E.g. pigpio.pi('soft', 8888)"""
+
+_except_2 = """
+Do you have permission to access the pigpio daemon?
+Perhaps it was started with sudo pigpiod -nlocalhost"""
+
+_except_3 = """
+Can't create callback thread.
+Perhaps too many simultaneous pigpio connections."""
 
 class _socklock:
    """
@@ -914,11 +983,11 @@ def _pigpio_command(sl, cmd, p1, p2, rl=True):
     sl:= command socket and lock.
    cmd:= the command to be executed.
     p1:= command parameter 1 (if applicable).
-     p2:=  command parameter 2 (if applicable).
+    p2:= command parameter 2 (if applicable).
    """
    sl.l.acquire()
    sl.s.send(struct.pack('IIII', cmd, p1, p2, 0))
-   dummy, res = struct.unpack('12sI', sl.s.recv(16))
+   dummy, res = struct.unpack('12sI', sl.s.recv(_SOCK_CMD_LEN))
    if rl: sl.l.release()
    return res
 
@@ -941,9 +1010,25 @@ def _pigpio_command_ext(sl, cmd, p1, p2, p3, extents, rl=True):
          ext.extend(x)
    sl.l.acquire()
    sl.s.sendall(ext)
-   dummy, res = struct.unpack('12sI', sl.s.recv(16))
+   dummy, res = struct.unpack('12sI', sl.s.recv(_SOCK_CMD_LEN))
    if rl: sl.l.release()
    return res
+
+class _event_ADT:
+   """
+   An ADT class to hold event callback information.
+   """
+
+   def __init__(self, event, func):
+      """
+      Initialises an event callback ADT.
+
+      event:= the event id.
+       func:= a user function taking one argument, the event id.
+      """
+      self.event = event
+      self.func = func
+      self.bit = 1<<event
 
 class _callback_ADT:
    """An ADT class to hold callback information."""
@@ -971,11 +1056,12 @@ class _callback_thread(threading.Thread):
       self.go = False
       self.daemon = True
       self.monitor = 0
+      self.event_bits = 0
       self.callbacks = []
-      self.sl.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      self.sl.s.settimeout(None)
-      self.sl.s.connect((host, port))
-      self.handle = _pigpio_command(self.sl, _PI_CMD_NOIB, 0, 0)
+      self.events = []
+      self.sl.s = socket.create_connection((host, port), None)
+      self.lastLevel = _pigpio_command(self.sl,  _PI_CMD_BR1, 0, 0)
+      self.handle = _u2i(_pigpio_command(self.sl, _PI_CMD_NOIB, 0, 0))
       self.go = True
       self.start()
 
@@ -1003,10 +1089,32 @@ class _callback_thread(threading.Thread):
             _pigpio_command(
                self.control, _PI_CMD_NB, self.handle, self.monitor)
 
+   def append_event(self, callb):
+      """
+      Adds an event callback to the notification thread.
+      """
+      self.events.append(callb)
+      self.event_bits = self.event_bits | callb.bit
+      _pigpio_command(self.control, _PI_CMD_EVM, self.handle, self.event_bits)
+
+   def remove_event(self, callb):
+      """
+      Removes an event callback from the notification thread.
+      """
+      if callb in self.events:
+         self.events.remove(callb)
+         new_event_bits = 0
+         for c in self.events:
+            new_event_bits |= c.bit
+         if new_event_bits != self.event_bits:
+            self.event_bits = new_event_bits
+            _pigpio_command(
+               self.control, _PI_CMD_EVM, self.handle, self.event_bits)
+
    def run(self):
       """Runs the notification thread."""
 
-      lastLevel = _pigpio_command(self.control,  _PI_CMD_BR1, 0, 0)
+      lastLevel = self.lastLevel
 
       MSG_SIZ = 12
 
@@ -1035,7 +1143,12 @@ class _callback_thread(threading.Thread):
                   gpio = flags & NTFY_FLAGS_GPIO
                   for cb in self.callbacks:
                      if cb.gpio == gpio:
-                        cb.func(cb.gpio, TIMEOUT, tick)
+                        cb.func(gpio, TIMEOUT, tick)
+               elif flags & NTFY_FLAGS_EVENT:
+                  event = flags & NTFY_FLAGS_GPIO
+                  for cb in self.events:
+                     if cb.event == event:
+                        cb.func(event, tick)
 
       self.sl.s.close()
 
@@ -1082,6 +1195,52 @@ class _callback:
       self._reset = True
       self.count = 0
 
+class _event:
+   """A class to provide event callbacks."""
+
+   def __init__(self, notify, event, func=None):
+      """
+      Initialise an event and adds it to the notification thread.
+      """
+      self._notify = notify
+      self.count=0
+      self._reset = False
+      if func is None:
+         func=self._tally
+      self.callb = _event_ADT(event, func)
+      self._notify.append_event(self.callb)
+
+   def cancel(self):
+      """
+      Cancels a event callback by removing it from the
+      notification thread.
+      """
+      self._notify.remove_event(self.callb)
+
+   def _tally(self, event, tick):
+      """Increment the event callback called count."""
+      if self._reset:
+         self._reset = False
+         self.count = 0
+      self.count += 1
+
+   def tally(self):
+      """
+      Provides a count of how many times the default tally
+      callback has triggered.
+
+      The count will be zero if the user has supplied their own
+      callback function.
+      """
+      return self.count
+
+   def reset_tally(self):
+      """
+      Resets the tally count to zero.
+      """
+      self._reset = True
+      self.count = 0
+
 class _wait_for_edge:
    """Encapsulates waiting for GPIO edges."""
 
@@ -1098,6 +1257,24 @@ class _wait_for_edge:
 
    def func(self, gpio, level, tick):
       """Sets wait_for_edge triggered."""
+      self.trigger = True
+
+class _wait_for_event:
+   """Encapsulates waiting for an event."""
+
+   def __init__(self, notify, event, timeout):
+      """Initialises wait_for_event."""
+      self._notify = notify
+      self.callb = _event_ADT(event, self.func)
+      self.trigger = False
+      self._notify.append_event(self.callb)
+      self.start = time.time()
+      while (self.trigger == False) and ((time.time()-self.start) < timeout):
+         time.sleep(0.05)
+      self._notify.remove_event(self.callb)
+
+   def func(self, event, tick):
+      """Sets wait_for_event triggered."""
       self.trigger = True
 
 class pi():
@@ -1465,7 +1642,7 @@ class pi():
       E.g. if the function returns 15 then the notifications must be
       read from /var/run/pigpio15.
 
-      Notifications have the following structure.
+      Notifications have the following structure:
 
       . .
       H seqno
@@ -1477,15 +1654,19 @@ class pi():
       seqno: starts at 0 each time the handle is opened and then
       increments by one for each report.
 
-      flags: two flags are defined, PI_NTFY_FLAGS_WDOG and
-      PI_NTFY_FLAGS_ALIVE.
+      flags: three flags are defined, PI_NTFY_FLAGS_WDOG,
+      PI_NTFY_FLAGS_ALIVE, and PI_NTFY_FLAGS_EVENT.
 
-      PI_NTFY_FLAGS_WDOG, if bit 5 is set then bits 0-4 of the
+      If bit 5 is set (PI_NTFY_FLAGS_WDOG) then bits 0-4 of the
       flags indicate a GPIO which has had a watchdog timeout.
 
-      PI_NTFY_FLAGS_ALIVE, if bit 6 is set this indicates a keep
+      If bit 6 is set (PI_NTFY_FLAGS_ALIVE) this indicates a keep
       alive signal on the pipe/socket and is sent once a minute
       in the absence of other notification activity.
+
+      If bit 7 is set (PI_NTFY_FLAGS_EVENT) then bits 0-4 of the
+      flags indicate an event which has been triggered.
+
 
       tick: the number of microseconds since system boot.  It wraps
       around after 1h12m.
@@ -1574,12 +1755,11 @@ class pi():
 
       The watchdog may be cancelled by setting timeout to 0.
 
-      If no level change has been detected for the GPIO for timeout
-      milliseconds any notification for the GPIO has a report written
-      to the fifo with the flags set to indicate a watchdog timeout.
+      Once a watchdog has been started callbacks for the GPIO
+      will be triggered every timeout interval after the last
+      GPIO activity.
 
-      The callback class interprets the flags and will
-      call registered callbacks for the GPIO with level TIMEOUT.
+      The callback will receive the special level TIMEOUT.
 
       ...
       pi.set_watchdog(23, 1000) # 1000 ms watchdog on GPIO 23
@@ -1696,7 +1876,7 @@ class pi():
       The same clock is available on multiple GPIO.  The latest
       frequency setting will be used by all GPIO which share a clock.
 
-      The GPIO must be one of the following.
+      The GPIO must be one of the following:
 
       . .
       4   clock 0  All models
@@ -1747,7 +1927,7 @@ class pi():
       The latest frequency and dutycycle setting will be used
       by all GPIO which share a PWM channel.
 
-      The GPIO must be one of the following.
+      The GPIO must be one of the following:
 
       . .
       12  PWM channel 0  All models but A and B
@@ -2382,7 +2562,7 @@ class pi():
 
       For the SMBus commands the low level transactions are shown
       at the end of the function description.  The following
-      abbreviations are used.
+      abbreviations are used:
 
       . .
       S     (1 bit) : Start bit
@@ -2952,6 +3132,175 @@ class pi():
       return bytes, data
 
 
+   def bb_spi_open(self, CS, MISO, MOSI, SCLK, baud=100000, spi_flags=0):
+      """
+      This function selects a set of GPIO for bit banging SPI at a
+      specified baud rate.
+
+            CS := 0-31
+          MISO := 0-31
+          MOSI := 0-31
+          SCLK := 0-31
+          baud := 50-250000
+      spiFlags := see below
+      
+      spiFlags consists of the least significant 22 bits.
+
+      . .
+      21 20 19 18 17 16 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+       0  0  0  0  0  0  R  T  0  0  0  0  0  0  0  0  0  0  0  p  m  m
+      . .
+
+      mm defines the SPI mode, defaults to 0
+
+      . .
+      Mode CPOL CPHA
+       0     0    0
+       1     0    1
+       2     1    0
+       3     1    1
+      . .
+
+      The following constants may be used to set the mode:
+
+      . .
+      pigpio.SPI_MODE_0
+      pigpio.SPI_MODE_1
+      pigpio.SPI_MODE_2
+      pigpio.SPI_MODE_3
+      . .
+
+      Alternatively pigpio.SPI_CPOL and/or pigpio.SPI_CPHA
+      may be used.
+
+      p is 0 if CS is active low (default) and 1 for active high.
+      pigpio.SPI_CS_HIGH_ACTIVE may be used to set this flag.
+
+      T is 1 if the least significant bit is transmitted on MOSI first,
+      the default (0) shifts the most significant bit out first.
+      pigpio.SPI_TX_LSBFIRST may be used to set this flag.
+
+      R is 1 if the least significant bit is received on MISO first,
+      the default (0) receives the most significant bit first.
+      pigpio.SPI_RX_LSBFIRST may be used to set this flag.
+
+      The other bits in spiFlags should be set to zero.
+
+      Returns 0 if OK, otherwise PI_BAD_USER_GPIO, PI_BAD_SPI_BAUD, or
+      PI_GPIO_IN_USE.
+
+      If more than one device is connected to the SPI bus (defined by
+      SCLK, MOSI, and MISO) each must have its own CS.
+
+      ...
+      bb_spi_open(10, MISO, MOSI, SCLK, 10000, 0); // device 1
+      bb_spi_open(11, MISO, MOSI, SCLK, 20000, 3); // device 2
+      ...
+      """
+      # I p1 CS
+      # I p2 0
+      # I p3 20
+      ## extension ##
+      # I MISO
+      # I MOSI
+      # I SCLK
+      # I baud
+      # I spi_flags
+      
+      extents = [struct.pack("IIIII", MISO, MOSI, SCLK, baud, spi_flags)]
+      return _u2i(_pigpio_command_ext(
+         self.sl, _PI_CMD_BSPIO, CS, 0, 20, extents))
+
+
+   def bb_spi_close(self, CS):
+      """
+      This function stops bit banging SPI on a set of GPIO
+      opened with [*bb_spi_open*].
+
+      CS:= 0-31, the CS GPIO used in a prior call to [*bb_spi_open*]
+
+      Returns 0 if OK, otherwise PI_BAD_USER_GPIO, or PI_NOT_SPI_GPIO.
+
+      ...
+      pi.bb_spi_close(CS)
+      ...
+      """
+      return _u2i(_pigpio_command(self.sl, _PI_CMD_BSPIC, CS, 0))
+
+
+   def bb_spi_xfer(self, CS, data):
+      """
+      This function executes a bit banged SPI transfer.
+
+        CS:= 0-31 (as used in a prior call to [*bb_spi_open*])
+      data:= data to be sent
+
+      The returned value is a tuple of the number of bytes read and a
+      bytearray containing the bytes.  If there was an error the
+      number of bytes read will be less than zero (and will contain
+      the error code).
+
+      ...
+      #!/usr/bin/env python
+
+      import pigpio
+
+      CE0=5
+      CE1=6
+      MISO=13
+      MOSI=19
+      SCLK=12
+
+      pi = pigpio.pi()
+      if not pi.connected:
+         exit()
+
+      pi.bb_spi_open(CE0, MISO, MOSI, SCLK, 10000, 0) # MCP4251 DAC
+      pi.bb_spi_open(CE1, MISO, MOSI, SCLK, 20000, 3) # MCP3008 ADC
+
+      for i in range(256):
+
+         count, data = pi.bb_spi_xfer(CE0, [0, i]) # Set DAC value
+
+         if count == 2:
+
+            count, data = pi.bb_spi_xfer(CE0, [12, 0]) # Read back DAC
+
+            if count == 2:
+
+               set_val = data[1]
+
+               count, data = pi.bb_spi_xfer(CE1, [1, 128, 0]) # Read ADC
+
+               if count == 3:
+
+                  read_val = ((data[1]&3)<<8) | data[2]
+
+                  print("{} {}".format(set_val, read_val))
+
+      pi.bb_spi_close(CE0)
+      pi.bb_spi_close(CE1)
+
+      pi.stop()
+      ...
+      """
+      # I p1 CS
+      # I p2 0
+      # I p3 len
+      ## extension ##
+      # s len data bytes
+
+      # Don't raise exception.  Must release lock.
+      bytes = u2i(_pigpio_command_ext(
+         self.sl, _PI_CMD_BSPIX, CS, 0, len(data), [data], False))
+      if bytes > 0:
+         data = self._rxbuf(bytes)
+      else:
+         data = ""
+      self.sl.l.release()
+      return bytes, data
+
+
    def bb_i2c_open(self, SDA, SCL, baud=100000):
       """
       This function selects a pair of GPIO for bit banging I2C at a
@@ -3024,7 +3373,7 @@ class pi():
 
       ...
       (count, data) = pi.bb_i2c_zip(
-                         h, [4, 0x53, 2, 7, 1, 0x32, 2, 6, 6, 3, 0])
+                         SDA, [4, 0x53, 2, 7, 1, 0x32, 2, 6, 6, 3, 0])
       ...
 
       The following command codes are supported:
@@ -3087,6 +3436,261 @@ class pi():
          data = ""
       self.sl.l.release()
       return bytes, data
+
+   def event_trigger(self, event):
+      """
+      This function signals the occurrence of an event.
+
+      event:= 0-31, the event
+
+      Returns 0 if OK, otherwise PI_BAD_EVENT_ID.
+
+      An event is a signal used to inform one or more consumers
+      to start an action.  Each consumer which has registered an
+      interest in the event (e.g. by calling [*event_callback*]) will
+      be informed by a callback.
+
+      One event, EVENT_BSC (31) is predefined.  This event is
+      auto generated on BSC slave activity.
+
+      The meaning of other events is arbitrary.
+
+      Note that other than its id and its tick there is no data associated
+      with an event.
+
+      ...
+      pi.event_trigger(23)
+      ...
+      """
+      return _u2i(_pigpio_command(self.sl, _PI_CMD_EVT, event, 0))
+
+
+   def bsc_xfer(self, bsc_control, data):
+      """
+      This function provides a low-level interface to the
+      SPI/I2C Slave peripheral.  This peripheral allows the
+      Pi to act as a slave device on an I2C or SPI bus.
+
+      I can't get SPI to work properly.  I tried with a
+      control word of 0x303 and swapped MISO and MOSI.
+
+
+      The function sets the BSC mode, writes any data in
+      the transmit buffer to the BSC transmit FIFO, and
+      copies any data in the BSC receive FIFO to the
+      receive buffer.
+
+      bsc_control:= see below
+             data:= the data bytes to place in the transmit FIFO.
+
+      The returned value is a tuple of the status (see below),
+      the number of bytes read, and a bytearray containing the
+      read bytes.  If there was an error the status will be less
+      than zero (and will contain the error code).
+
+      Note that the control word sets the BSC mode.  The BSC will
+      stay in that mode until a different control word is sent.
+
+      The BSC peripheral uses GPIO 18 (SDA) and 19 (SCL)
+      in I2C mode and GPIO 18 (MOSI), 19 (SCLK), 20 (MISO),
+      and 21 (CE) in SPI mode.  You need to swap MISO/MOSI
+      between master and slave.
+
+      When a zero control word is received GPIO 18-21 will be reset
+      to INPUT mode.
+
+      bsc_control consists of the following bits:
+
+      . .
+      22 21 20 19 18 17 16 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+       a  a  a  a  a  a  a  -  - IT HC TF IR RE TE BK EC ES PL PH I2 SP EN
+      . .
+
+      Bits 0-13 are copied unchanged to the BSC CR register.  See
+      pages 163-165 of the Broadcom peripherals document for full
+      details.
+
+      aaaaaaa @ defines the I2C slave address (only relevant in I2C mode)
+      IT      @ invert transmit status flags
+      HC      @ enable host control
+      TF      @ enable test FIFO
+      IR      @ invert receive status flags
+      RE      @ enable receive
+      TE      @ enable transmit
+      BK      @ abort operation and clear FIFOs
+      EC      @ send control register as first I2C byte
+      ES      @ send status register as first I2C byte
+      PL      @ set SPI polarity high
+      PH      @ set SPI phase high
+      I2      @ enable I2C mode
+      SP      @ enable SPI mode
+      EN      @ enable BSC peripheral
+
+      The status has the following format:
+
+      . .
+      20 19 18 17 16 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+       S  S  S  S  S  R  R  R  R  R  T  T  T  T  T RB TE RF TF RE TB
+      . .
+
+      Bits 0-15 are copied unchanged from the BSC FR register.  See
+      pages 165-166 of the Broadcom peripherals document for full
+      details.
+
+      SSSSS @ number of bytes successfully copied to transmit FIFO
+      RRRRR @ number of bytes in receieve FIFO
+      TTTTT @ number of bytes in transmit FIFO
+      RB    @ receive busy
+      TE    @ transmit FIFO empty
+      RF    @ receive FIFO full
+      TF    @ transmit FIFO full
+      RE    @ receive FIFO empty
+      TB    @ transmit busy
+
+      ...
+      (status, count, data) = pi.bsc_xfer(0x330305, "Hello!")
+      ...
+      """
+      # I p1 control
+      # I p2 0
+      # I p3 len
+      ## extension ##
+      # s len data bytes
+
+      # Don't raise exception.  Must release lock.
+      bytes = u2i(_pigpio_command_ext(
+         self.sl, _PI_CMD_BSCX, bsc_control, 0, len(data), [data], False))
+      if bytes > 0:
+         rx = self._rxbuf(bytes)
+         status = struct.unpack('I', rx[0:4])[0]
+         bytes -= 4
+         data = rx[4:]
+      else:
+         status = bytes
+         bytes = 0
+         data = bytearray(b'')
+      self.sl.l.release()
+      return status, bytes, data
+
+   def bsc_i2c(self, i2c_address, data=[]):
+      """
+      This function allows the Pi to act as a slave I2C device.
+
+      The data bytes (if any) are written to the BSC transmit
+      FIFO and the bytes in the BSC receive FIFO are returned.
+
+      i2c_address:= the I2C slave address.
+             data:= the data bytes to transmit.
+
+      The returned value is a tuple of the status, the number
+      of bytes read, and a bytearray containing the read bytes.
+
+      See [*bsc_xfer*] for details of the status value.
+
+      If there was an error the status will be less than zero
+      (and will contain the error code).
+
+      Note that an i2c_address of 0 may be used to close
+      the BSC device and reassign the used GPIO (18/19)
+      as inputs.
+
+      This example assumes GPIO 2/3 are connected to GPIO 18/19.
+
+      ...
+      #!/usr/bin/env python
+      import time
+      import pigpio
+
+      I2C_ADDR=0x13
+
+      def i2c(id, tick):
+          global pi
+
+          s, b, d = pi.bsc_i2c(I2C_ADDR)
+          if b:
+              if d[0] == ord('t'): # 116 send 'HH:MM:SS*'
+
+                  print("sent={} FR={} received={} [{}]".
+                     format(s>>16, s&0xfff,b,d))
+
+                  s, b, d = pi.bsc_i2c(I2C_ADDR,
+                     "{}*".format(time.asctime()[11:19]))
+
+              elif d[0] == ord('d'): # 100 send 'Sun Oct 30*'
+
+                  print("sent={} FR={} received={} [{}]".
+                     format(s>>16, s&0xfff,b,d))
+
+                  s, b, d = pi.bsc_i2c(I2C_ADDR,
+                     "{}*".format(time.asctime()[:10]))
+
+      pi = pigpio.pi()
+
+      if not pi.connected:
+          exit()
+
+      # Respond to BSC slave activity
+
+      e = pi.event_callback(pigpio.EVENT_BSC, i2c)
+
+      pi.bsc_i2c(I2C_ADDR) # Configure BSC as I2C slave
+
+      time.sleep(600)
+
+      e.cancel()
+
+      pi.bsc_i2c(0) # Disable BSC peripheral
+
+      pi.stop()
+      ...
+
+      While running the above.
+
+      . .
+      $ i2cdetect -y 1
+          0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
+      00:          -- -- -- -- -- -- -- -- -- -- -- -- --
+      10: -- -- -- 13 -- -- -- -- -- -- -- -- -- -- -- --
+      20: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+      30: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+      40: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+      50: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+      60: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+      70: -- -- -- -- -- -- -- --
+
+      $ pigs i2co 1 0x13 0
+      0
+
+      $ pigs i2cwd 0 116
+      $ pigs i2crd 0 9 -a
+      9 10:13:58*
+
+      $ pigs i2cwd 0 116
+      $ pigs i2crd 0 9 -a
+      9 10:14:29*
+
+      $ pigs i2cwd 0 100
+      $ pigs i2crd 0 11 -a
+      11 Sun Oct 30*
+
+      $ pigs i2cwd 0 100
+      $ pigs i2crd 0 11 -a
+      11 Sun Oct 30*
+
+      $ pigs i2cwd 0 116
+      $ pigs i2crd 0 9 -a
+      9 10:23:16*
+
+      $ pigs i2cwd 0 100
+      $ pigs i2crd 0 11 -a
+      11 Sun Oct 30*
+      . .
+      """
+      if i2c_address:
+         control = (i2c_address<<16)|0x305
+      else:
+         control = 0
+      return self.bsc_xfer(control, data)
 
    def spi_open(self, spi_channel, baud, spi_flags=0):
       """
@@ -3162,7 +3766,14 @@ class pi():
       For bits 9-16 there will be two bytes per character. 
       For bits 17-32 there will be four bytes per character.
 
-      E.g. 32 12-bit words will be transferred in 64 bytes.
+      Multi-byte transfers are made in least significant byte
+      first order.
+
+      E.g. to transfer 32 11-bit words data should
+      contain 64 bytes.
+
+      E.g. to transfer the 14 bit value 0x1ABC send the
+      bytes 0xBC followed by 0x1A.
 
       The other bits in flags should be set to zero.
 
@@ -3340,6 +3951,8 @@ class pi():
 
       handle:= >=0 (as returned by a prior call to [*serial_open*]).
 
+      If no data is ready a negative error code will be returned.
+
       ...
       b = pi.serial_read_byte(h1)
       ...
@@ -3362,18 +3975,19 @@ class pi():
       return _u2i(
          _pigpio_command(self.sl, _PI_CMD_SERWB, handle, byte_val))
 
-   def serial_read(self, handle, count):
+   def serial_read(self, handle, count=1000):
       """
       Reads up to count bytes from the device associated with handle.
 
       handle:= >=0 (as returned by a prior call to [*serial_open*]).
-       count:= >0, the number of bytes to read.
+       count:= >0, the number of bytes to read (defaults to 1000).
 
-      The returned value is a tuple of the number of bytes read and a
-      bytearray containing the bytes.  If there was an error the
+      The returned value is a tuple of the number of bytes read and
+      a bytearray containing the bytes.  If there was an error the
       number of bytes read will be less than zero (and will contain
       the error code).
 
+      If no data is ready a bytes read of zero is returned.
       ...
       (b, d) = pi.serial_read(h2, 100)
       if b > 0:
@@ -3470,7 +4084,13 @@ class pi():
 
       Returns 0 if OK, otherwise PI_BAD_USER_GPIO, or PI_BAD_FILTER.
 
-      Note, each (stable) edge will be timestamped [*steady*]
+      This filter affects the GPIO samples returned to callbacks set up
+      with [*callback*] and [*wait_for_edge*].
+
+      It does not affect levels read by [*read*],
+      [*read_bank_1*], or [*read_bank_2*].
+
+      Each (stable) edge will be timestamped [*steady*]
       microseconds after it was first detected.
 
       ...
@@ -3494,7 +4114,13 @@ class pi():
 
       Returns 0 if OK, otherwise PI_BAD_USER_GPIO, or PI_BAD_FILTER.
 
-      Note, level changes before and after the active period may
+      This filter affects the GPIO samples returned to callbacks set up
+      with [*callback*] and [*wait_for_edge*].
+
+      It does not affect levels read by [*read*],
+      [*read_bank_1*], or [*read_bank_2*].
+
+      Level changes before and after the active period may
       be reported.  Your software must be designed to cope with
       such reports.
 
@@ -3848,8 +4474,9 @@ class pi():
       file_name:= the file to open.
       file_mode:= the file open mode.
 
-      Returns a handle (>=0) if OK, otherwise PI_NO_HANDLE, PI_NO_FILE_ACCESS,
-      PI_BAD_FILE_MODE, PI_FILE_OPEN_FAILED, or PI_FILE_IS_A_DIR.
+      Returns a handle (>=0) if OK, otherwise PI_NO_HANDLE,
+      PI_NO_FILE_ACCESS, PI_BAD_FILE_MODE,
+      PI_FILE_OPEN_FAILED, or PI_FILE_IS_A_DIR.
 
       ...
       h = pi.file_open("/home/pi/shared/dir_3/file.txt",
@@ -3862,9 +4489,9 @@ class pi():
 
       File
 
-      A file may only be opened if permission is granted by an entry in
-      /opt/pigpio/access.  This is intended to allow remote access to files
-      in a more or less controlled manner.
+      A file may only be opened if permission is granted by an entry
+      in /opt/pigpio/access.  This is intended to allow remote access
+      to files in a more or less controlled manner.
 
       Each entry in /opt/pigpio/access takes the form of a file path
       which may contain wildcards followed by a single letter permission.
@@ -3874,7 +4501,7 @@ class pi():
       Where more than one entry matches a file the most specific rule
       applies.  If no entry matches a file then access is denied.
 
-      Suppose /opt/pigpio/access contains the following entries
+      Suppose /opt/pigpio/access contains the following entries:
 
       . .
       /home/* n
@@ -3895,7 +4522,7 @@ class pi():
       may be created in that directory.
 
       In an attempt to prevent risky permissions the following paths are
-      ignored in /opt/pigpio/access.
+      ignored in /opt/pigpio/access:
 
       . .
       a path containing ..
@@ -3905,14 +4532,14 @@ class pi():
 
       Mode
 
-      The mode may have the following values.
+      The mode may have the following values:
 
       Constant   @ Value @ Meaning
       FILE_READ  @   1   @ open file for reading
       FILE_WRITE @   2   @ open file for writing
       FILE_RW    @   3   @ open file for reading and writing
 
-      The following values may be or'd into the mode.
+      The following values may be or'd into the mode:
 
       Name        @ Value @ Meaning
       FILE_APPEND @ 4     @ All writes append data to the end of the file
@@ -3932,7 +4559,7 @@ class pi():
       if not pi.connected:
          exit()
 
-      # Assumes /opt/pigpio/access contains the following line.
+      # Assumes /opt/pigpio/access contains the following line:
       # /ram/*.c r
 
       handle = pi.file_open("/ram/pigpio.c", pigpio.FILE_READ)
@@ -4079,7 +4706,7 @@ class pi():
       if not pi.connected:
          exit()
 
-      # Assumes /opt/pigpio/access contains the following line.
+      # Assumes /opt/pigpio/access contains the following line:
       # /ram/*.c r
 
       c, d = pi.file_list("/ram/p*.c")
@@ -4123,7 +4750,7 @@ class pi():
       the shell script exit function.  If the script can't be
       found 32512 will be returned.
 
-      The following table gives some example returned statuses.
+      The following table gives some example returned statuses:
 
       Script exit status @ Returned system call status
       1                  @ 256
@@ -4154,6 +4781,7 @@ class pi():
       return _u2i(_pigpio_command_ext(
          self.sl, _PI_CMD_SHELL, ls, 0, ls+lp+1, [shellscr+'\x00'+pstring]))
 
+
    def callback(self, user_gpio, edge=RISING_EDGE, func=None):
       """
       Calls a user supplied function (a callback) whenever the
@@ -4165,6 +4793,20 @@ class pi():
 
       The user supplied callback receives three parameters, the GPIO,
       the level, and the tick.
+
+      . .
+      Parameter   Value    Meaning
+
+      GPIO        0-31     The GPIO which has changed state
+
+      level       0-2      0 = change to low (a falling edge)
+                           1 = change to high (a rising edge)
+                           2 = no level change (a watchdog timeout)
+
+      tick        32 bit   The number of microseconds since boot
+                           WARNING: this wraps around from
+                           4294967295 to 0 roughly every 72 minutes
+      . .
 
       If a user callback is not specified a default tally callback is
       provided which simply counts edges.  The count may be retrieved
@@ -4194,6 +4836,45 @@ class pi():
       ...
       """
       return _callback(self._notify, user_gpio, edge, func)
+
+   def event_callback(self, event, func=None):
+      """
+      Calls a user supplied function (a callback) whenever the
+      specified event is signalled.
+
+      event:= 0-31.
+       func:= user supplied callback function.
+
+      The user supplied callback receives two parameters, the event id,
+      and the tick.
+
+      If a user callback is not specified a default tally callback is
+      provided which simply counts events.  The count may be retrieved
+      by calling the tally function.  The count may be reset to zero
+      by calling the reset_tally function.
+
+      The callback may be cancelled by calling the event_cancel function.
+
+      An event may have multiple callbacks (although I can't think of
+      a reason to do so).
+
+      ...
+      def cbf(event, tick):
+         print(event, tick)
+
+      cb1 = pi.event_callback(22, cbf)
+
+      cb2 = pi.event_callback(4)
+
+      print(cb2.tally())
+
+      cb2.reset_tally()
+
+      cb1.event_cancel() # To cancel callback cb1.
+      ...
+      """
+
+      return _event(self._notify, event, func)
 
    def wait_for_edge(self, user_gpio, edge=RISING_EDGE, wait_timeout=60.0):
       """
@@ -4230,8 +4911,31 @@ class pi():
       a = _wait_for_edge(self._notify, user_gpio, edge, wait_timeout)
       return a.trigger
 
+   def wait_for_event(self, event, wait_timeout=60.0):
+      """
+      Wait for an event.
+
+             event:= 0-31.
+      wait_timeout:= >=0.0 (default 60.0).
+
+      The function returns when the event is signalled or after
+      the number of seconds specified by timeout has expired.
+
+      The function returns True if the event is detected,
+      otherwise False.
+
+      ...
+      if pi.wait_for_event(23):
+         print("event detected")
+      else:
+         print("wait for event timed out")
+      ...
+      """
+      a = _wait_for_event(self._notify, event, wait_timeout)
+      return a.trigger
+
    def __init__(self,
-                host = os.getenv("PIGPIO_ADDR", ''),
+                host = os.getenv("PIGPIO_ADDR", 'localhost'),
                 port = os.getenv("PIGPIO_PORT", 8888)):
       """
       Grants access to a Pi's GPIO.
@@ -4269,44 +4973,50 @@ class pi():
 
       port = int(port)
 
+      if host == '':
+         host = "localhost"
+
       self._host = host
       self._port = port
 
-      self.sl.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      self.sl.s.settimeout(None)
-
-      # Disable the Nagle algorithm.
-      self.sl.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
       try:
-         self.sl.s.connect((host, port))
+         self.sl.s = socket.create_connection((host, port), None)
+
+         # Disable the Nagle algorithm.
+         self.sl.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
          self._notify = _callback_thread(self.sl, host, port)
 
       except socket.error:
+         exception = 1
+
+      except struct.error:
+         exception = 2
+
+      except error:
+         exception = 3
+
+      else:
+         exception = 0
+         atexit.register(self.stop)
+
+      if exception != 0:
+
          self.connected = False
+
          if self.sl.s is not None:
             self.sl.s = None
-         if host == '':
-            h = "localhost"
+
+         s = "Can't connect to pigpio at {}({})".format(host, str(port))
+
+         print(_except_a.format(s))
+         if exception == 1:
+             print(_except_1)
+         elif exception == 2:
+             print(_except_2)
          else:
-            h = host
-
-         s = "Can't connect to pigpio at {}({})".format(str(h), str(port))
-
-         print("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%")
-         print(s)
-         print("")
-         print("Did you start the pigpio daemon? E.g. sudo pigpiod")
-         print("")
-         print("Did you specify the correct Pi host/port in the environment")
-         print("variables PIGPIO_ADDR/PIGPIO_PORT?")
-         print("E.g. export PIGPIO_ADDR=soft, export PIGPIO_PORT=8888")
-         print("")
-         print("Did you specify the correct Pi host/port in the")
-         print("pigpio.pi() function? E.g. pigpio.pi('soft', 8888))")
-         print("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%")
-      else:
-         atexit.register(self.stop)
+             print(_except_3)
+         print(_except_z)
 
    def stop(self):
       """Release pigpio resources.
@@ -4370,6 +5080,18 @@ def xref():
 
    bits = (1<<1) | (1<<7) | (1<<23)
 
+   bsc_control:
+
+   . .
+   22 21 20 19 18 17 16 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+    a  a  a  a  a  a  a  -  - IT HC TF IR RE TE BK EC ES PL PH I2 SP EN
+   . .
+
+   aaaaaaa defines the I2C slave address (only relevant in I2C mode)
+
+   Bits 0-13 are copied unchanged to the BSC CR register.  See
+   pages 163-165 of the Broadcom peripherals document.
+
    byte_val: 0-255
    A whole number.
 
@@ -4381,6 +5103,9 @@ def xref():
 
    count:
    The number of bytes of data to be transferred.
+
+   CS:
+   The GPIO used for the slave select signal when bit banging SPI.
 
    data:
    Data to be transmitted, a series of bytes.
@@ -4402,9 +5127,12 @@ def xref():
    range_        @ Fully On
 
    edge: 0-2
+
+   . .
    EITHER_EDGE = 2 
    FALLING_EDGE = 1 
    RISING_EDGE = 0
+   . .
 
    errnum: <0
 
@@ -4519,10 +5247,17 @@ def xref():
    PI_FILE_IS_A_DIR = -138
    PI_BAD_SHELL_STATUS = -139
    PI_BAD_SCRIPT_NAME = -140
+   PI_BAD_SPI_BAUD = -141
+   PI_NOT_SPI_GPIO = -142
+   PI_BAD_EVENT_ID = -143 
    . .
 
+   event:0-31
+   An event is a signal used to inform one or more consumers
+   to start an action.
+
    file_mode:
-   The mode may have the following values.
+   The mode may have the following values
 
    . .
    FILE_READ   1
@@ -4530,7 +5265,7 @@ def xref():
    FILE_RW     3
    . .
 
-   The following values can be or'd into the file open mode.
+   The following values can be or'd into the file open mode
 
    . .
    FILE_APPEND 4
@@ -4568,7 +5303,7 @@ def xref():
 
    See [*get_hardware_revision*].
 
-   The user GPIO are marked with an X in the following table.
+   The user GPIO are marked with an X in the following table
 
    . .
              0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
@@ -4595,8 +5330,13 @@ def xref():
    of a pulse.
 
    handle: >=0
-   A number referencing an object opened by one of [*file_open*],
-   [*i2c_open*], [*notify_open*], [*serial_open*], [*spi_open*].
+   A number referencing an object opened by one of the following
+
+   [*file_open*] 
+   [*i2c_open*] 
+   [*notify_open*] 
+   [*serial_open*] 
+   [*spi_open*]
 
    host:
    The name or IP address of the Pi running the pigpio daemon.
@@ -4618,6 +5358,8 @@ def xref():
    level logic.
 
    level: 0-1 (2)
+
+   . .
    CLEAR = 0 
    HIGH = 1 
    LOW = 0 
@@ -4625,11 +5367,16 @@ def xref():
    ON = 1 
    SET = 1 
    TIMEOUT = 2 # only returned for a watchdog timeout
+   . .
+
+   MISO:
+   The GPIO used for the MISO signal when bit banging SPI.
 
    mode:
 
    1.The operational mode of a GPIO, normally INPUT or OUTPUT.
 
+   . .
    ALT0 = 4 
    ALT1 = 5 
    ALT2 = 6 
@@ -4638,13 +5385,19 @@ def xref():
    ALT5 = 2 
    INPUT = 0 
    OUTPUT = 1
+   . .
 
    2. The mode of waveform transmission.
 
+   . .
    WAVE_MODE_ONE_SHOT = 0 
    WAVE_MODE_REPEAT = 1 
    WAVE_MODE_ONE_SHOT_SYNC = 2 
    WAVE_MODE_REPEAT_SYNC = 3
+   . .
+
+   MOSI:
+   The GPIO used for the MOSI signal when bit banging SPI.
 
    offset: >=0
    The offset wave data starts from the beginning of the waveform
@@ -4673,9 +5426,11 @@ def xref():
    The string to be passed to a [*shell*] script to be executed.
 
    pud: 0-2
+   . .
    PUD_DOWN = 1 
    PUD_OFF = 0 
    PUD_UP = 2 
+   . .
 
    pulse_len: 1-100
    The length of the trigger pulse in microseconds.
@@ -4709,6 +5464,9 @@ def xref():
    SCL:
    The user GPIO to use for the clock when bit banging I2C.
 
+   SCLK::
+   The GPIO used for the SCLK signal when bit banging SPI.
+
    script:
    The text of a script to store on the pigpio daemon.
 
@@ -4721,9 +5479,11 @@ def xref():
    seek_from: 0-2
    Direction to seek for [*file_seek*].
 
+   . .
    FROM_START=0 
    FROM_CURRENT=1 
    FROM_END=2 
+   . .
 
    seek_offset:
    The number of bytes to move forward (positive) or backwards
@@ -4781,13 +5541,20 @@ def xref():
    The number of seconds to wait in [*wait_for_edge*] before timing out.
 
    wave_add_*:
-   One of [*wave_add_new*] , [*wave_add_generic*], [*wave_add_serial*].
+   One of the following
+
+   [*wave_add_new*] 
+   [*wave_add_generic*] 
+   [*wave_add_serial*]
 
    wave_id: >=0
    A number referencing a wave created by [*wave_create*].
 
    wave_send_*:
-   One of [*wave_send_once*], [*wave_send_repeat*].
+   One of the following
+
+   [*wave_send_once*] 
+   [*wave_send_repeat*]
 
    wdog_timeout: 0-60000
    Defines a GPIO watchdog timeout in milliseconds.  If no level

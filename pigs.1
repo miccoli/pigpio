@@ -2,7 +2,7 @@
 ." Process this file with
 ." groff -man -Tascii foo.1
 ."
-.TH pigs 1 2012-2015 Linux "pigpio archive"
+.TH pigs 1 2012-2017 Linux "pigpio archive"
 .SH NAME
 pigs - command line socket access to the pigpio daemon.
 
@@ -188,6 +188,37 @@ When a command takes a number as a parameter it may be entered as hex
 
 .br
 E.g. 23 is 23 decimal, 0x100 is 256 decimal, 070 is 56 decimal.
+
+.br
+Some commands can return a variable number of data bytes.  By
+default this data is displayed as decimal.  The pigs -a option
+can be used to force the display as ASCII and the pigs -x
+option can be used to force the display as hex.
+
+.br
+E.g. assuming the transmitted serial data is the letters ABCDEONM
+
+.br
+
+.EX
+$ pigs slr 4 100
+.br
+8 65 66 67 68 69 79 78 77
+.br
+
+.br
+$ pigs -a slr 4 100
+.br
+8 ABCDEONM
+.br
+
+.br
+$ pigs -x slr 4 100
+.br
+8 41 42 43 44 45 4f 4e 4d
+.br
+
+.EE
 
 .br
 
@@ -484,6 +515,432 @@ ERROR: no permission to update one or more GPIO
 
 .br
 
+.IP "\fBBSCX bctl bvs\fP - BSC I2C/SPI transfer"
+.IP "" 4
+
+.br
+This command performs a BSC I2C/SPI slave transfer as defined by
+\fBbctl\fP with data \fBbvs\fP.
+
+.br
+I can't get SPI to work properly.  I tried with a
+control word of 0x303 and swapped MISO and MOSI.
+
+.br
+The command sets the BSC mode and writes any data \fBbvs\fP
+to the BSC transmit FIFO.  It returns the data count (at least 1
+for the status word), the status word, followed by any data bytes
+read from the BSC receive FIFO.
+
+.br
+Note that the control word sets the BSC mode.  The BSC will stay in
+that mode until a different control word is sent.
+
+.br
+For I2C use a control word of (I2C address << 16) + 0x305.
+
+.br
+E.g. to talk as I2C slave with address 0x13 use 0x130305.
+
+.br
+The BSC peripheral uses GPIO 18 (SDA) and 19 (SCL) in I2C mode
+and GPIO 18 (MOSI), 19 (SCLK), 20 (MISO), and 21 (CE) in SPI mode.  You
+need to swap MISO/MOSI between master and slave.
+
+.br
+When a zero control word is received GPIO 18-21 will be reset
+to INPUT mode.
+
+.br
+The control word consists of the following bits.
+
+.br
+
+.EX
+22 21 20 19 18 17 16 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+.br
+ a  a  a  a  a  a  a  -  - IT HC TF IR RE TE BK EC ES PL PH I2 SP EN
+.br
+
+.EE
+
+.br
+Bits 0-13 are copied unchanged to the BSC CR register.  See
+pages 163-165 of the Broadcom peripherals document for full
+details.
+
+.br
+
+.EX
+aaaaaaa   defines the I2C slave address (only relevant in I2C mode)
+IT        invert transmit status flags
+HC        enable host control
+TF        enable test FIFO
+IR        invert receive status flags
+RE        enable receive
+TE        enable transmit
+BK        abort operation and clear FIFOs
+EC        send control register as first I2C byte
+ES        send status register as first I2C byte
+PL        set SPI polarity high
+PH        set SPI phase high
+I2        enable I2C mode
+SP        enable SPI mode
+EN        enable BSC peripheral
+
+.EE
+
+.br
+The returned status has the following format
+
+.br
+
+.EX
+20 19 18 17 16 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+.br
+ S  S  S  S  S  R  R  R  R  R  T  T  T  T  T RB TE RF TF RE TB
+.br
+
+.EE
+
+.br
+Bits 0-15 are copied unchanged from the BSC FR register.  See
+pages 165-166 of the Broadcom peripherals document for full
+details.
+
+.br
+
+.EX
+SSSSS   number of bytes successfully copied to transmit FIFO
+RRRRR   number of bytes in receieve FIFO
+TTTTT   number of bytes in transmit FIFO
+RB      receive busy
+TE      transmit FIFO empty
+RF      receive FIFO full
+TF      transmit FIFO full
+RE      receive FIFO empty
+TB      transmit busy
+
+.EE
+
+.br
+This example assumes that GPIO 2/3 are connected to GPIO 18/19.
+
+.br
+
+\fBExample\fP
+.br
+
+.EX
+$ pigs bscx 0x130305 # start BSC as I2C slave 0x13
+.br
+1 18
+.br
+
+.br
+$ i2cdetect -y 1
+.br
+     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
+.br
+00:          -- -- -- -- -- -- -- -- -- -- -- -- --
+.br
+10: -- -- -- 13 -- -- -- -- -- -- -- -- -- -- -- --
+.br
+20: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+.br
+30: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+.br
+40: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+.br
+50: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+.br
+60: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+.br
+70: -- -- -- -- -- -- -- --
+.br
+
+.br
+$ pigs i2co 1 0x13 0 # get handle for device 0x13 on bus 1
+.br
+0
+.br
+
+.br
+$ pigs i2cwd 0 90 87 51 9 23 # write 5 bytes
+.br
+
+.br
+$ pigs bscx 0x130305 # check for data
+.br
+6 18 90 87 51 9 23
+.br
+
+.br
+$ pigs bscx 0x130305 11 13 15 17 # check for data and send 4 bytes
+.br
+1 262338
+.br
+
+.br
+$ pigs i2crd 0 4 # read 4 bytes
+.br
+4 11 13 15 17
+.br
+
+.br
+$ pigs i2cwd 0 90 87 51 9 23 # write 5 bytes
+.br
+$ pigs bscx 0x130305 11 13 15 17 # check for data and send 4 bytes
+.br
+6 262338 90 87 51 9 23
+.br
+
+.br
+$ pigs i2crd 0 4
+.br
+4 11 13 15 17
+.br
+
+.br
+$ pigs bscx 0x130305 22 33 44 55 66
+.br
+1 327938
+.br
+$ pigs i2crd 0 5
+.br
+5 22 33 44 55 66
+.br
+
+.EE
+
+.br
+
+.IP "\fBBSPIC cs\fP - Close bit bang SPI"
+.IP "" 4
+
+.br
+This command stops bit banging SPI on a set of GPIO
+opened with \fBBSPIO\fP.
+
+.br
+The set of GPIO is specifed by \fBcs\fP.
+
+.br
+Upon success nothing is returned.  On error a negative status code
+will be returned.
+
+.br
+
+\fBExample\fP
+.br
+
+.EX
+$ pigs bspic 10
+.br
+
+.br
+$ pigs bspic 10
+.br
+-142
+.br
+ERROR: no bit bang SPI in progress on GPIO
+.br
+
+.EE
+
+.br
+
+.IP "\fBBSPIO cs miso mosi sclk b spf\fP - Open bit bang SPI"
+.IP "" 4
+
+.br
+This command starts bit banging SPI on a group of GPIO with slave
+select \fBcs\fP, MISO \fBmiso\fP, MOSI \fBmosi\fP, and clock \fBsclk\fP.
+
+.br
+Data will be transferred at baud \fBb\fP bits per second (which may
+be set in the range 50-250000).
+
+.br
+The flags \fBspf\fP may be used to modify the default behaviour of
+mode 0, active low chip select.
+
+.br
+The flags consists of the least significant 22 bits.
+
+.br
+
+.EX
+21 20 19 18 17 16 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+.br
+ 0  0  0  0  0  0  R  T  0  0  0  0  0  0  0  0  0  0  0  p  m  m
+.br
+
+.EE
+
+.br
+mm defines the SPI mode.
+
+.br
+
+.EX
+Mode POL PHA
+.br
+ 0    0   0
+.br
+ 1    0   1
+.br
+ 2    1   0
+.br
+ 3    1   1
+.br
+
+.EE
+
+.br
+p is 0 if CS is active low (default) and 1 for active high.
+
+.br
+T is 1 if the least significant bit is transmitted on MOSI first, the
+default (0) shifts the most significant bit out first.
+
+.br
+R is 1 if the least significant bit is received on MISO first, the
+default (0) receives the most significant bit first.
+
+.br
+The other bits in flags should be set to zero.
+
+.br
+Upon success 0 is returned.  On error a negative status code
+will be returned.
+
+.br
+If more than one device is connected to the SPI bus (defined by
+SCLK, MOSI, and MISO) each must have its own CS.
+
+.br
+
+\fBExample\fP
+.br
+
+.EX
+$ pigs bspio  9 11 12 13 50000 0
+.br
+
+.br
+$ pigs bspio 10 11 12 13 50000 0
+.br
+
+.br
+$ pigs bspio 29 19 20 21 50000 0 # GPIO 29 not avaialble on this Pi
+.br
+-41
+.br
+ERROR: no permission to update GPIO
+.br
+
+.EE
+
+.br
+
+.IP "\fBBSPIX cs bvs\fP - SPI bit bang transfer"
+.IP "" 4
+
+.br
+This command writes bytes \fBbvs\fP to the bit bang SPI device
+associated with slave select \fBcs\fP.  It returns the same
+number of bytes read from the device.
+
+.br
+Upon success the count of returned bytes followed by the bytes themselves
+is returned.  On error a negative status code will be returned.
+
+.br
+
+\fBExample\fP
+.br
+
+.EX
+$ pigs bspio 5 13 19 12 10000 0 # MCP4251 DAC
+.br
+$ pigs bspio 6 13 19 12 20000 3 # MCP3008 ADC
+.br
+
+.br
+$ pigs bspix 5 0 16             # set DAC to 16
+.br
+2 255 255
+.br
+
+.br
+$ pigs bspix 5 12 0             # read back DAC
+.br
+2 254 16
+.br
+
+.br
+$ pigs bspix 6 1 128 0          # read ADC input 0
+.br
+3 0 3 184                       # 952
+.br
+
+.br
+$ pigs bspix 5 0 240            # set DAC to 240
+.br
+2 255 255
+.br
+
+.br
+$ pigs bspix 5 12 0             # read back DAC
+.br
+2 254 240
+.br
+
+.br
+$ pigs bspix 6 1 128 0          # read ADC input 0
+.br
+3 0 0 63                        # 63
+.br
+
+.br
+$ pigs bspix 5 0 128            # set DAC to 128
+.br
+2 255 255
+.br
+
+.br
+$ pigs bspix 5 12 0             # read back DAC
+.br
+2 254 128
+.br
+
+.br
+$ pigs bspix 6 1 128 0          # read ADC input 0
+.br
+3 0 1 255                       # 511
+.br
+
+.br
+$ pigs bspic 5                  # close SPI CS 5
+.br
+$ pigs bspic 6                  # close SPI CS 6
+.br
+
+.br
+$ pigs bspic 5                  # try to close SPI CS 5 again
+.br
+-142
+.br
+ERROR: no bit bang SPI in progress on GPIO
+.br
+
+.EE
+
+.br
+
+.br
+
 .IP "\fBCF1 uvs\fP - Custom function 1"
 .IP "" 4
 
@@ -515,6 +972,72 @@ configuration settings.
 .IP "" 4
 This command sets the value of the internal library
 configuration settings to \fBv\fP.
+
+.br
+
+.IP "\fBEVM h bits\fP - Set events to monitor"
+.IP "" 4
+This command starts event reporting on handle \fBh\fP (returned by
+a prior call to \fBNO\fP).
+
+.br
+Upon success nothing is returned.  On error a negative status code
+will be returned.
+
+.br
+The notification gets reports for each event specified by \fBbits\fP.
+
+.br
+
+\fBExample\fP
+.br
+
+.EX
+$ pigs evm 0 -1 # Shorthand for events 0-31.
+.br
+$ pigs evm 0 0xf0 # Get notifications for events 4-7.
+.br
+
+.br
+$ pigs evm 1 0xf
+.br
+-25
+.br
+ERROR: unknown handle
+.br
+
+.EE
+
+.br
+
+.IP "\fBEVT event\fP - Trigger event"
+.IP "" 4
+This command triggers event \fBevent\fP.
+
+.br
+One event, number 31, is predefined.  This event is
+auto generated on BSC slave activity.
+
+.br
+
+\fBExample\fP
+.br
+
+.EX
+$ pigs evt 12
+.br
+$ pigs evt 5
+.br
+
+.br
+$ pigs evt 32
+.br
+-143
+.br
+ERROR: bad event id
+.br
+
+.EE
 
 .br
 
@@ -555,6 +1078,12 @@ Level changes on the GPIO \fBu\fP are not reported unless the level
 has been stable for at least \fBstdy\fP microseconds.  The
 level is then reported.  Level changes of less than \fBstdy\fP
 microseconds are ignored.
+
+.br
+The filter only affects callbacks (including pipe notifications).
+
+.br
+The \fBR/READ\fP, \fBBR1\fP, and \fBBR2\fP commands are not affected.
 
 .br
 Note, each (stable) edge will be timestamped \fBstdy\fP microseconds
@@ -636,6 +1165,12 @@ Level changes on the GPIO \fBu\fP are ignored until a level which has
 been stable for \fBstdy\fP microseconds is detected.  Level
 changes on the GPIO are then reported for \fBactv\fP microseconds
 after which the process repeats.
+
+.br
+The filter only affects callbacks (including pipe notifications).
+
+.br
+The \fBR/READ\fP, \fBBR1\fP, and \fBBR2\fP commands are not affected.
 
 .br
 Note, level changes before and after the active period may
@@ -906,7 +1441,7 @@ returned.  On error a negative status code will be returned.
 .br
 
 .EX
-$ pigs fs 0 0 0 # Seek to start of file plus 200
+$ pigs fs 0 200 0 # Seek to start of file plus 200
 .br
 200
 .br
@@ -1094,7 +1629,7 @@ The GPIO must be one of the following.
 5   clock 1  All models but A and B (reserved for system use)
 6   clock 2  All models but A and B
 20  clock 0  All models but A and B
-21  clock 1  All models but A and B (Rev. 2) (reserved for system use)
+21  clock 1  All models but A and B Rev.2 (reserved for system use)
 
 .EE
 
@@ -3434,7 +3969,14 @@ For bits 9-16 there will be two bytes per character.
 For bits 17-32 there will be four bytes per character.
 
 .br
-E.g. 32 12-bit words will be transferred in 64 bytes.
+Multi-byte transfers are made in least significant byte first order.
+
+.br
+E.g. to transfer 32 11-bit words 64 bytes need to be sent.
+
+.br
+E.g. to transfer the 14 bit value 0x1ABC send the bytes 0xBC followed
+by 0x1A.
 
 .br
 The other bits in flags should be set to zero.
@@ -3660,11 +4202,10 @@ One watchdog may be registered per GPIO.
 The watchdog may be cancelled by setting timeout to 0.
 
 .br
-If no level change has been detected for the GPIO for timeout milliseconds:-
-
-.br
-any notification for the GPIO has a report written to the fifo with
-the flags set to indicate a watchdog timeout.
+Once a watchdog has been started monitors of the GPIO
+will be triggered every timeout interval after the last
+GPIO activity.  The watchdog expiry will be indicated by
+a special TIMEOUT value.
 
 .br
 
@@ -4446,6 +4987,11 @@ the transmission of serial data (I2C/SPI/serial link, waves).
 
 .br
 
+.IP "\fBbctl\fP - BSC control word" 0
+The command expects a BSC control word, see \fBBSCX\fP.
+
+.br
+
 .IP "\fBbit\fP - bit value (0-1)" 0
 The command expects 0 or 1.
 
@@ -4481,6 +5027,11 @@ The command expects a frequency.
 
 .br
 
+.IP "\fBcs\fP - GPIO (0-31)" 0
+The GPIO used for the slave select signal when bit banging SPI.
+
+.br
+
 .IP "\fBdb\fP - serial data bits (1-32)" 0
 The command expects the number of data bits per serial character.
 
@@ -4502,6 +5053,12 @@ The command expects the name of a tty serial device, e.g.
 .br
 
 .EE
+
+.br
+
+.IP "\fBevent\fP - 0-31" 0
+An event is a signal used to inform one or more consumers
+to start an action.
 
 .br
 
@@ -4620,6 +5177,11 @@ Value     0        1       4      5      6      7      3      2
 
 .br
 
+.IP "\fBmiso\fP - GPIO (0-31)" 0
+The GPIO used for the MISO signal when bit banging SPI.
+
+.br
+
 .IP "\fBmode\fP - file open mode" 0
 One of the following values.
 
@@ -4645,6 +5207,11 @@ CREATE   8       The file is created if it doesn't exist
 TRUNC    16      The file is truncated
 
 .EE
+
+.br
+
+.IP "\fBmosi\fP - GPIO (0-31)" 0
+The GPIO used for the MOSI signal when bit banging SPI.
 
 .br
 
@@ -4764,6 +5331,11 @@ when bit banging I2C.
 
 .br
 
+.IP "\fBsclk\fP - user GPIO (0-31)" 0
+The GPIO used for the SCLK signal when bit banging SPI.
+
+.br
+
 .IP "\fBsda\fP - user GPIO (0-31)" 0
 The command expects the number of the GPIO to be used for SDA
 when bit banging I2C.
@@ -4781,7 +5353,7 @@ The command expects a script id as returned by a call to \fBPROC\fP.
 .br
 
 .IP "\fBspf\fP - SPI flags (32 bits)" 0
-See \fBSPIO\fP.
+See \fBSPIO\fP and \fBBSPIO\fP.
 
 .br
 
@@ -5097,6 +5669,7 @@ CMP x   Compare x with accumulator                    F=A-x
 DCR y   Decrement register                            --*y; F=*y
 DCRA    Decrement accumulator                         --A; F=A
 DIV x   Divide x into accumulator                     A/=x; F=A
+EVTWT   Wait for an event to occur                    A=wait(x); F=A
 HALT    Halt                                          Halt
 INR y   Increment register                            ++*y; F=*y
 INRA    Increment accumulator                         ++A; F=A
@@ -5136,6 +5709,9 @@ x may be a constant, a parameter (p0-p9), or a variable (v0-v149).
 .br
 y may be a parameter (p0-p9), or a variable (v0-v149).  If p or v isn't
 specified y is assumed to be a variable.
+
+.br
+The EVTWT command parameter is a bit-mask with 1 set for events of interest.
 
 .br
 The WAIT command parameter is a bit-mask with 1 set for GPIO of interest.
